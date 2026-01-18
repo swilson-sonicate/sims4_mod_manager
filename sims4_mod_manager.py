@@ -19,7 +19,7 @@ Requirements:
     pip install requests beautifulsoup4
 """
 
-__version__ = "1.0.1"
+__version__ = "1.0.2"
 
 import os
 import sys
@@ -57,6 +57,18 @@ try:
 except ImportError:
     BS4_AVAILABLE = False
     print("Note: Install beautifulsoup4 for web scraping features: pip install beautifulsoup4")
+
+# Rich terminal UI
+from rich.console import Console
+from rich.table import Table
+from rich.panel import Panel
+from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TaskProgressColumn
+from rich.prompt import Prompt, Confirm
+from rich.text import Text
+from rich.style import Style
+from rich import box
+
+console = Console()
 
 
 # ============================================================================
@@ -1834,49 +1846,51 @@ class SimsModManager:
         self.scanner = ModScanner(self.mods_path)
         self.update_checker = UpdateChecker()
         self.mod_updater = ModUpdater(self.mods_path)
-        
-        print(f"Sims 4 Mod Manager initialized")
-        print(f"Mods folder: {self.mods_path}")
-        print(f"Folder exists: {self.mods_path.exists()}")
-        print()
+
+        console.print(f"[bold]Mods folder:[/bold] {self.mods_path}")
+        status = "[green]Found[/green]" if self.mods_path.exists() else "[red]Not found[/red]"
+        console.print(f"[bold]Status:[/bold] {status}")
+        console.print()
     
     def scan_mods(self) -> list[dict]:
         """Scan all mods and update the database."""
-        print("Scanning mods folder...")
-        mods = self.scanner.scan()
-        
-        # Update database with scanned mods
-        current_hashes = set()
-        for mod in mods:
-            current_hashes.add(mod['hash'])
-            existing = self.db.get_mod(mod['hash'])
-            
-            if existing:
-                # Preserve user-added metadata
-                mod['source_url'] = existing.get('source_url')
-                mod['notes'] = existing.get('notes')
-                mod['creator'] = existing.get('creator')
-                mod['added_date'] = existing.get('added_date', mod['modified_date'])
-                mod['last_checked'] = existing.get('last_checked')
-            else:
-                mod['added_date'] = datetime.now().isoformat()
-            
-            self.db.add_mod(mod['hash'], mod)
-        
-        # Remove mods that no longer exist
-        removed = []
-        for file_hash in list(self.db.data["mods"].keys()):
-            if file_hash not in current_hashes:
-                removed.append(self.db.data["mods"][file_hash]['name'])
-                self.db.remove_mod(file_hash)
-        
-        print(f"Found {len(mods)} mods")
-        if removed:
-            print(f"Removed {len(removed)} deleted mods from database")
+        with console.status("[bold green]Scanning mods folder...", spinner="dots"):
+            mods = self.scanner.scan()
 
-        # Show version detection summary
+            # Update database with scanned mods
+            current_hashes = set()
+            for mod in mods:
+                current_hashes.add(mod['hash'])
+                existing = self.db.get_mod(mod['hash'])
+
+                if existing:
+                    # Preserve user-added metadata
+                    mod['source_url'] = existing.get('source_url')
+                    mod['notes'] = existing.get('notes')
+                    mod['creator'] = existing.get('creator')
+                    mod['added_date'] = existing.get('added_date', mod['modified_date'])
+                    mod['last_checked'] = existing.get('last_checked')
+                else:
+                    mod['added_date'] = datetime.now().isoformat()
+
+                self.db.add_mod(mod['hash'], mod)
+
+            # Remove mods that no longer exist
+            removed = []
+            for file_hash in list(self.db.data["mods"].keys()):
+                if file_hash not in current_hashes:
+                    removed.append(self.db.data["mods"][file_hash]['name'])
+                    self.db.remove_mod(file_hash)
+
+        # Show results
+        script_count = sum(1 for m in mods if m['is_script'])
+        package_count = len(mods) - script_count
         with_versions = [m for m in mods if m.get('local_version')]
-        print(f"Detected versions for {len(with_versions)}/{len(mods)} mods")
+
+        console.print(f"[green]Found {len(mods)} mods[/green] ([yellow]{script_count} scripts[/yellow], [blue]{package_count} packages[/blue])")
+        if removed:
+            console.print(f"[dim]Removed {len(removed)} deleted mods from database[/dim]")
+        console.print(f"[dim]Detected versions for {len(with_versions)}/{len(mods)} mods[/dim]")
 
         return mods
 
@@ -2024,40 +2038,60 @@ class SimsModManager:
     def list_mods(self, show_details: bool = False):
         """List all tracked mods."""
         mods = list(self.db.data["mods"].values())
-        
+
         if not mods:
-            print("No mods found. Run a scan first!")
+            console.print("[yellow]No mods found. Run a scan first![/yellow]")
             return
-        
+
         # Sort by name
         mods.sort(key=lambda m: m['name'].lower())
-        
-        print(f"\n{'='*60}")
-        print(f"INSTALLED MODS ({len(mods)} total)")
-        print(f"{'='*60}\n")
-        
+
         # Group by subfolder
-        by_folder = {}
+        by_folder: dict[str, list] = {}
         for mod in mods:
             folder = mod.get('subfolder') or 'Root'
             if folder not in by_folder:
                 by_folder[folder] = []
             by_folder[folder].append(mod)
-        
+
+        # Create table
+        if show_details:
+            table = Table(
+                title=f"[bold]Installed Mods[/bold] ({len(mods)} total)",
+                box=box.ROUNDED,
+                show_lines=True
+            )
+            table.add_column("Type", style="cyan", width=4, justify="center")
+            table.add_column("Name", style="white")
+            table.add_column("Version", style="green")
+            table.add_column("Size", style="dim", justify="right")
+            table.add_column("Modified", style="dim")
+            table.add_column("Source", style="blue", overflow="fold")
+        else:
+            table = Table(
+                title=f"[bold]Installed Mods[/bold] ({len(mods)} total)",
+                box=box.ROUNDED
+            )
+            table.add_column("Type", style="cyan", width=4, justify="center")
+            table.add_column("Folder", style="dim")
+            table.add_column("Name", style="white")
+            table.add_column("Version", style="green")
+
         for folder in sorted(by_folder.keys()):
-            print(f"📁 {folder}/")
             for mod in by_folder[folder]:
-                icon = "📜" if mod['is_script'] else "📦"
-                version_str = f" (v{mod['local_version']})" if mod.get('local_version') else ""
-                print(f"   {icon} {mod['name']}{version_str}")
+                icon = "[yellow]TS4[/yellow]" if mod['is_script'] else "[blue]PKG[/blue]"
+                version = mod.get('local_version', '-')
+
                 if show_details:
-                    print(f"      Size: {mod['size_mb']} MB")
-                    print(f"      Modified: {mod['modified_date'][:10]}")
-                    if mod.get('local_version'):
-                        print(f"      Version: {mod['local_version']}")
-                    if mod.get('source_url'):
-                        print(f"      Source: {mod['source_url']}")
-            print()
+                    size = f"{mod['size_mb']} MB"
+                    modified = mod['modified_date'][:10]
+                    source = mod.get('source_url', '-')
+                    table.add_row(icon, mod['name'], version, size, modified, source)
+                else:
+                    table.add_row(icon, folder, mod['name'], version)
+
+        console.print()
+        console.print(table)
     
     def add_mod_source(self, mod_name: str, source_url: str, creator: Optional[str] = None, notes: Optional[str] = None):
         """Add source URL and metadata to a mod.
@@ -2083,11 +2117,11 @@ class SimsModManager:
                     matches.append((file_hash, mod))
 
         if not matches:
-            print(f"No mods found matching '{mod_name}'")
+            console.print(f"[yellow]No mods found matching '{mod_name}'[/yellow]")
             return
 
         # Update all matching mods
-        print(f"Found {len(matches)} mod(s) matching '{mod_name}':")
+        console.print(f"Found [cyan]{len(matches)}[/cyan] mod(s) matching '[bold]{mod_name}[/bold]':")
         for file_hash, mod in matches:
             mod['source_url'] = source_url
             if creator:
@@ -2095,23 +2129,21 @@ class SimsModManager:
             if notes:
                 mod['notes'] = notes
             self.db.add_mod(file_hash, mod)
-            print(f"  ✓ {mod['name']}")
+            console.print(f"  [green]✓[/green] {mod['name']}")
     
     def check_for_updates(self):
         """Check all mods with source URLs for updates."""
-        print("\nChecking for updates...")
-
         mods_with_sources = [
             (h, m) for h, m in self.db.data["mods"].items()
             if m.get('source_url')
         ]
 
         if not mods_with_sources:
-            print("No mods have source URLs configured.")
-            print("Add source URLs with: manager.add_mod_source('mod_name', 'url')")
+            console.print("[yellow]No mods have source URLs configured.[/yellow]")
+            console.print("[dim]Add source URLs using option 7 in the menu[/dim]")
             return
 
-        print(f"Checking {len(mods_with_sources)} mods with source URLs...\n")
+        console.print(f"\n[bold]Checking {len(mods_with_sources)} mods with source URLs...[/bold]\n")
 
         needs_update = []
         up_to_date = []
@@ -2119,7 +2151,7 @@ class SimsModManager:
 
         for file_hash, mod in mods_with_sources:
             source_url = mod['source_url']
-            print(f"Checking: {mod['name']}...")
+            console.print(f"[bold]Checking:[/bold] {mod['name']}...")
 
             update_info = self.update_checker.check_url(source_url)
 
@@ -2130,22 +2162,20 @@ class SimsModManager:
 
                 local_version = mod.get('local_version')
                 remote_version = update_info.get('version')
-
-                # Compare versions
                 comparison = UpdateChecker.compare_versions(local_version, remote_version)
 
                 # Show what we found
                 if update_info.get('title'):
-                    print(f"   Title: {update_info.get('title')}")
+                    console.print(f"   [dim]Title:[/dim] {update_info.get('title')}")
 
                 if local_version or remote_version:
                     local_str = local_version or 'unknown'
                     remote_str = remote_version or 'unknown'
-                    print(f"   Local version:  {local_str}")
-                    print(f"   Remote version: {remote_str}")
+                    console.print(f"   [dim]Local version:[/dim]  [yellow]{local_str}[/yellow]")
+                    console.print(f"   [dim]Remote version:[/dim] [cyan]{remote_str}[/cyan]")
 
                     if comparison == 'update':
-                        print(f"   ⚠️  UPDATE AVAILABLE!")
+                        console.print(f"   [bold red]UPDATE AVAILABLE![/bold red]")
                         needs_update.append({
                             'hash': file_hash,
                             'mod': mod,
@@ -2156,10 +2186,10 @@ class SimsModManager:
                             'remote_info': update_info
                         })
                     elif comparison == 'current':
-                        print(f"   ✅ Up to date")
+                        console.print(f"   [green]✓ Up to date[/green]")
                         up_to_date.append(mod['name'])
                     elif comparison == 'newer':
-                        print(f"   ℹ️  Local version is newer than remote")
+                        console.print(f"   [blue]ℹ Local version is newer than remote[/blue]")
                         up_to_date.append(mod['name'])
                     else:
                         unknown_status.append({
@@ -2179,13 +2209,12 @@ class SimsModManager:
                     })
 
                 if update_info.get('last_updated'):
-                    print(f"   Last updated on site: {update_info.get('last_updated')}")
+                    console.print(f"   [dim]Last updated on site:[/dim] {update_info.get('last_updated')}")
                 if update_info.get('download_url'):
-                    dl_text = update_info.get('download_text', 'Download')
                     dl_url = update_info.get('download_url')
-                    print(f"   Download: {dl_text} - {dl_url}")
+                    console.print(f"   [dim]Download:[/dim] [cyan]{dl_url}[/cyan]")
             else:
-                print(f"   Could not retrieve update info")
+                console.print(f"   [yellow]Could not retrieve update info[/yellow]")
                 unknown_status.append({
                     'hash': file_hash,
                     'mod': mod,
@@ -2194,49 +2223,57 @@ class SimsModManager:
                     'remote_info': None
                 })
 
+            console.print()  # Blank line between mods
+
         # Summary
-        print(f"\n{'='*60}")
-        print("UPDATE CHECK SUMMARY")
-        print(f"{'='*60}")
+        console.print(Panel.fit("[bold]Update Check Summary[/bold]", border_style="blue"))
 
         if needs_update:
-            print(f"\n🔴 UPDATES AVAILABLE ({len(needs_update)}):")
+            update_table = Table(title="[bold red]Updates Available[/bold red]", box=box.ROUNDED)
+            update_table.add_column("#", style="bold", width=3)
+            update_table.add_column("Mod", style="white")
+            update_table.add_column("Local", style="yellow")
+            update_table.add_column("Remote", style="green")
+
             for i, item in enumerate(needs_update, 1):
-                print(f"   {i}. 📦 {item['name']}")
-                print(f"      {item.get('local_version', '?')} → {item.get('remote_version', '?')}")
+                update_table.add_row(
+                    str(i),
+                    item['name'],
+                    item.get('local_version', '?'),
+                    item.get('remote_version', '?')
+                )
+            console.print(update_table)
 
         if up_to_date:
-            print(f"\n🟢 UP TO DATE ({len(up_to_date)}):")
+            console.print(f"\n[bold green]Up to Date ({len(up_to_date)})[/bold green]")
             for name in up_to_date:
-                print(f"   ✓ {name}")
+                console.print(f"  [green]✓[/green] {name}")
 
         if unknown_status:
-            print(f"\n🟡 UNKNOWN STATUS ({len(unknown_status)}):")
-            print("   (Could not compare versions)")
+            console.print(f"\n[bold yellow]Unknown Status ({len(unknown_status)})[/bold yellow] [dim](Could not compare versions)[/dim]")
             for item in unknown_status:
-                print(f"   ? {item['name']}")
+                console.print(f"  [yellow]?[/yellow] {item['name']}")
 
         # Offer to install updates
         if needs_update:
-            print(f"\n{'─'*60}")
-            print("INSTALL UPDATES")
-            print(f"{'─'*60}")
-            print("\nOptions:")
-            print("  Enter a number (1-{}) to update that mod".format(len(needs_update)))
-            print("  Enter 'all' to update all mods")
-            print("  Enter 'skip' to skip updates")
+            console.print()
+            console.print(Panel(
+                f"Enter [cyan]1-{len(needs_update)}[/cyan] to update a specific mod\n"
+                f"Enter [cyan]all[/cyan] to update all mods\n"
+                f"Enter [cyan]skip[/cyan] to skip updates",
+                title="Install Updates",
+                border_style="blue"
+            ))
 
-            choice = input("\nYour choice: ").strip().lower()
+            choice = Prompt.ask("Your choice", default="skip").strip().lower()
 
             if choice == 'skip' or choice == '':
-                print("Updates skipped.")
+                console.print("[dim]Updates skipped.[/dim]")
             elif choice == 'all':
-                print("\nUpdating all mods...")
+                console.print("\n[bold]Updating all mods...[/bold]")
                 for item in needs_update:
                     download_url = item['remote_info'].get('download_url') or item['url']
                     self.mod_updater.update_mod(item['mod'], download_url, self.db.data["mods"])
-                # Re-scan after updates
-                print("\nRe-scanning mods folder...")
                 self.scan_mods()
             else:
                 try:
@@ -2245,115 +2282,151 @@ class SimsModManager:
                         item = needs_update[idx]
                         download_url = item['remote_info'].get('download_url') or item['url']
                         self.mod_updater.update_mod(item['mod'], download_url, self.db.data["mods"])
-                        # Re-scan after update
-                        print("\nRe-scanning mods folder...")
                         self.scan_mods()
                     else:
-                        print("Invalid selection.")
+                        console.print("[red]Invalid selection.[/red]")
                 except ValueError:
-                    print("Invalid input.")
+                    console.print("[red]Invalid input.[/red]")
 
     def import_downloaded_mod(self):
         """Import a mod from the Downloads folder."""
         self.mod_updater.import_from_downloads()
         # Re-scan after import
-        print("\nRe-scanning mods folder...")
         self.scan_mods()
     
     def find_potentially_broken(self) -> list[dict]:
         """Find mods that might be broken after a game update."""
-        print("\nAnalyzing mods for potential issues...\n")
-        
         issues = []
         mods = list(self.db.data["mods"].values())
-        
-        # Check for script mods (most likely to break)
-        script_mods = [m for m in mods if m['is_script']]
+
+        with console.status("[bold]Analyzing mods for potential issues...", spinner="dots"):
+            # Check for script mods (most likely to break)
+            script_mods = [m for m in mods if m['is_script']]
+
+            # Check for very old mods
+            old_threshold = datetime.now() - timedelta(days=180)
+            old_mods = []
+            for mod in mods:
+                try:
+                    mod_date = datetime.fromisoformat(mod['modified_date'])
+                    if mod_date < old_threshold:
+                        old_mods.append(mod)
+                except (ValueError, KeyError):
+                    pass
+
+        # Display results
         if script_mods:
-            print(f"⚠️  Found {len(script_mods)} script mods (most likely to break after updates):")
+            console.print(f"\n[bold yellow]Script Mods ({len(script_mods)})[/bold yellow] - [dim]Most likely to break after game updates[/dim]")
+            script_table = Table(box=box.SIMPLE)
+            script_table.add_column("Name", style="white")
+            script_table.add_column("Version", style="green")
             for mod in script_mods:
-                print(f"   - {mod['name']}")
+                script_table.add_row(mod['name'], mod.get('local_version', '-'))
                 issues.append({
                     'mod': mod,
                     'reason': 'Script mod - verify compatibility after game updates',
                     'severity': 'high'
                 })
-        
-        # Check for very old mods
-        old_threshold = datetime.now() - timedelta(days=180)
-        old_mods = []
-        for mod in mods:
-            try:
-                mod_date = datetime.fromisoformat(mod['modified_date'])
-                if mod_date < old_threshold:
-                    old_mods.append(mod)
-            except (ValueError, KeyError):
-                pass
-        
+            console.print(script_table)
+
         if old_mods:
-            print(f"\n⚠️  Found {len(old_mods)} mods not updated in 6+ months:")
+            console.print(f"\n[bold yellow]Old Mods ({len(old_mods)})[/bold yellow] - [dim]Not updated in 6+ months[/dim]")
+            old_table = Table(box=box.SIMPLE)
+            old_table.add_column("Name", style="white")
+            old_table.add_column("Last Modified", style="dim")
             for mod in old_mods:
-                print(f"   - {mod['name']} (modified: {mod['modified_date'][:10]})")
+                old_table.add_row(mod['name'], mod['modified_date'][:10])
                 issues.append({
                     'mod': mod,
                     'reason': 'Not updated in 6+ months',
                     'severity': 'medium'
                 })
-        
+            console.print(old_table)
+
         if not issues:
-            print("✅ No obvious issues detected!")
-        
+            console.print("\n[bold green]No obvious issues detected![/bold green]")
+
         return issues
     
     def backup_mods(self, backup_path: Optional[Path] = None):
         """Create a backup of all mods."""
         if backup_path is None:
             backup_path = self.mods_path.parent / f"Mods_Backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        
-        print(f"Creating backup at: {backup_path}")
-        shutil.copytree(self.mods_path, backup_path)
-        print("Backup complete!")
+
+        console.print(f"[bold]Creating backup at:[/bold] {backup_path}")
+        with console.status("[bold green]Copying files...", spinner="dots"):
+            shutil.copytree(self.mods_path, backup_path)
+        console.print("[bold green]Backup complete![/bold green]")
         return backup_path
     
-    def generate_report(self) -> str:
+    def generate_report(self) -> Panel:
         """Generate a summary report of all mods."""
         mods = list(self.db.data["mods"].values())
-        
+
         total_size = sum(m['size_bytes'] for m in mods)
         script_count = sum(1 for m in mods if m['is_script'])
         package_count = len(mods) - script_count
         with_sources = sum(1 for m in mods if m.get('source_url'))
-        
-        report = f"""
-╔══════════════════════════════════════════════════════════════╗
-║                  SIMS 4 MOD MANAGER REPORT                   ║
-║                  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}                       ║
-╠══════════════════════════════════════════════════════════════╣
-║  Mods Folder: {str(self.mods_path)[:45]:<45} ║
-╠══════════════════════════════════════════════════════════════╣
-║  STATISTICS                                                  ║
-║  ─────────────────────────────────────────────────────────── ║
-║  Total Mods:        {len(mods):<40} ║
-║  Package Files:     {package_count:<40} ║
-║  Script Mods:       {script_count:<40} ║
-║  Total Size:        {total_size / (1024*1024):.2f} MB{' ':<33} ║
-║  With Source URLs:  {with_sources:<40} ║
-╚══════════════════════════════════════════════════════════════╝
-"""
-        return report
+        with_versions = sum(1 for m in mods if m.get('local_version'))
+
+        # Create stats table
+        stats_table = Table(show_header=False, box=None, padding=(0, 2))
+        stats_table.add_column("Label", style="bold")
+        stats_table.add_column("Value", style="cyan")
+
+        stats_table.add_row("Total Mods", str(len(mods)))
+        stats_table.add_row("Package Files", f"[blue]{package_count}[/blue]")
+        stats_table.add_row("Script Mods", f"[yellow]{script_count}[/yellow]")
+        stats_table.add_row("Total Size", f"{total_size / (1024*1024):.2f} MB")
+        stats_table.add_row("With Source URLs", f"{with_sources}")
+        stats_table.add_row("With Versions", f"{with_versions}")
+
+        # Create the report panel
+        report_text = Text()
+        report_text.append(f"Mods Folder: ", style="bold")
+        report_text.append(f"{self.mods_path}\n\n", style="dim")
+
+        return Panel(
+            stats_table,
+            title=f"[bold]Mod Manager Report[/bold] - {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+            subtitle=f"[dim]{self.mods_path}[/dim]",
+            border_style="green",
+            padding=(1, 2)
+        )
 
 
 # ============================================================================
 # COMMAND LINE INTERFACE
 # ============================================================================
 
+def show_menu() -> Table:
+    """Create the main menu table."""
+    table = Table(show_header=False, box=box.SIMPLE, padding=(0, 2))
+    table.add_column("Key", style="bold cyan", width=4)
+    table.add_column("Action", style="white")
+
+    table.add_row("1", "Scan mods folder")
+    table.add_row("2", "List all mods")
+    table.add_row("3", "List mods (detailed)")
+    table.add_row("4", "Check for updates & install")
+    table.add_row("5", "Import mod from Downloads")
+    table.add_row("6", "Find potentially broken mods")
+    table.add_row("7", "Add source URL to mod")
+    table.add_row("8", "Backup mods folder")
+    table.add_row("9", "Generate report")
+    table.add_row("10", "Debug mod version detection")
+    table.add_row("0", "[bold red]Exit[/bold red]")
+
+    return table
+
+
 def main():
     """Main CLI interface."""
-    print("""
-    ╔═══════════════════════════════════════════════════════════╗
-    ║           🎮 SIMS 4 MOD MANAGER & UPDATE CHECKER 🎮       ║
-    ╚═══════════════════════════════════════════════════════════╝
-    """)
+    console.print(Panel.fit(
+        "[bold green]SIMS 4 MOD MANAGER[/bold green]\n[dim]Track, update, and manage your mods[/dim]",
+        border_style="green",
+        padding=(1, 4)
+    ))
 
     # Parse command line arguments
     global DEBUG
@@ -2362,7 +2435,7 @@ def main():
     if '--debug' in args:
         DEBUG = True
         args.remove('--debug')
-        print("[Debug mode enabled]")
+        console.print("[dim][Debug mode enabled][/dim]")
 
     # Check for updates on startup
     updater = AutoUpdater()
@@ -2370,7 +2443,7 @@ def main():
         # User chose to update - exit to allow update to proceed
         sys.exit(0)
 
-    print()  # Add spacing after update check
+    console.print()  # Add spacing after update check
 
     # Check for custom path argument
     mods_path = None
@@ -2378,37 +2451,24 @@ def main():
         mods_path = Path(args[0])
 
     manager = SimsModManager(mods_path)
-    
+
     if not manager.mods_path.exists():
-        print(f"\n❌ Mods folder not found at: {manager.mods_path}")
-        print("\nPlease either:")
-        print("  1. Run this script with the correct path:")
-        print("     python sims4_mod_manager.py /path/to/your/Mods")
-        print("  2. Or edit the script to set your custom path")
+        console.print(f"\n[bold red]Mods folder not found at:[/bold red] {manager.mods_path}")
+        console.print("\nPlease either:")
+        console.print("  1. Run this script with the correct path:")
+        console.print("     [cyan]python sims4_mod_manager.py /path/to/your/Mods[/cyan]")
+        console.print("  2. Or edit the script to set your custom path")
         return
 
     # Automatically scan mods folder on startup
     manager.scan_mods()
 
     while True:
-        print("\n" + "="*50)
-        print("MAIN MENU")
-        print("="*50)
-        print("1. Scan mods folder")
-        print("2. List all mods")
-        print("3. List mods (detailed)")
-        print("4. Check for updates & install")
-        print("5. Import mod from Downloads")
-        print("6. Find potentially broken mods")
-        print("7. Add source URL to mod")
-        print("8. Backup mods folder")
-        print("9. Generate report")
-        print("10. Debug mod version detection")
-        print("0. Exit")
-        print()
+        console.print()
+        console.print(Panel(show_menu(), title="[bold]Main Menu[/bold]", border_style="blue"))
 
-        choice = input("Enter choice (0-10): ").strip()
-        
+        choice = Prompt.ask("[bold cyan]Enter choice[/bold cyan]", default="0")
+
         if choice == '1':
             manager.scan_mods()
 
@@ -2428,34 +2488,33 @@ def main():
             manager.find_potentially_broken()
 
         elif choice == '7':
-            print("\nAdd source URL to a mod")
-            print("(This helps track updates from ModTheSims and other sites)")
-            print("Tip: Use wildcards to match multiple mods (e.g., 'WonderfulWhims*', '*MCCC*')")
-            mod_name = input("Enter mod name or pattern: ").strip()
-            source_url = input("Enter source URL: ").strip()
-            creator = input("Enter creator name (optional): ").strip() or None
-            notes = input("Enter notes (optional): ").strip() or None
-            manager.add_mod_source(mod_name, source_url, creator, notes)
+            console.print("\n[bold]Add source URL to a mod[/bold]")
+            console.print("[dim]This helps track updates from ModTheSims and other sites[/dim]")
+            console.print("[dim]Tip: Use wildcards to match multiple mods (e.g., 'WonderfulWhims*', '*MCCC*')[/dim]")
+            mod_name = Prompt.ask("Enter mod name or pattern")
+            source_url = Prompt.ask("Enter source URL")
+            creator = Prompt.ask("Enter creator name", default="")
+            notes = Prompt.ask("Enter notes", default="")
+            manager.add_mod_source(mod_name, source_url, creator or None, notes or None)
 
         elif choice == '8':
-            confirm = input("Create backup? This may take a while for large mod folders (y/n): ")
-            if confirm.lower() == 'y':
+            if Confirm.ask("Create backup? This may take a while for large mod folders"):
                 manager.backup_mods()
 
         elif choice == '9':
-            print(manager.generate_report())
+            console.print(manager.generate_report())
 
         elif choice == '10':
-            print("\nDebug mod version detection")
-            mod_name = input("Enter mod name (partial match OK): ").strip()
+            console.print("\n[bold]Debug mod version detection[/bold]")
+            mod_name = Prompt.ask("Enter mod name (partial match OK)")
             manager.debug_mod_version(mod_name)
 
         elif choice == '0':
-            print("\nGoodbye! Happy Simming! 🎮")
+            console.print("\n[bold green]Goodbye! Happy Simming![/bold green]")
             break
 
         else:
-            print("Invalid choice. Please enter 0-10.")
+            console.print("[bold red]Invalid choice. Please enter 0-10.[/bold red]")
 
 
 if __name__ == "__main__":
