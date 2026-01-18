@@ -1,0 +1,4 @@
+# Development dependencies for Sims 4 Mod Manager
+
+# Build tool for creating standalone executables
+pyinstaller>=6.0.0
