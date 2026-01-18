@@ -23,6 +23,18 @@ __version__ = "1.0.0"
 
 import os
 import sys
+
+# Debug mode is disabled in production (frozen executable)
+# Can be overridden with --debug flag
+DEBUG = not getattr(sys, 'frozen', False)
+
+
+def debug_print(*args, **kwargs):
+    """Print only when debug mode is enabled."""
+    if DEBUG:
+        print(*args, **kwargs)
+
+
 import json
 import hashlib
 import fnmatch
@@ -37,6 +49,7 @@ import re
 import shutil
 import tempfile
 import subprocess
+import webbrowser
 
 try:
     from bs4 import BeautifulSoup
@@ -1087,7 +1100,7 @@ class UpdateChecker:
             # If no version found on main page, try following download link
             if not update_info.get('version') and download_info and download_info.get('url'):
                 download_url = download_info['url']
-                print(f"      DEBUG: Following download link: {download_url}")
+                debug_print(f"      DEBUG: Following download link: {download_url}")
                 # Only follow if it's on the same domain or a known mod hosting site
                 if self._should_follow_link(mod_url, download_url):
                     try:
@@ -1097,7 +1110,7 @@ class UpdateChecker:
 
                         # Search for version on download page
                         dl_version = self._find_version(dl_soup)
-                        print(f"      DEBUG: Version from download page: {dl_version}")
+                        debug_print(f"      DEBUG: Version from download page: {dl_version}")
                         if dl_version:
                             update_info['version'] = dl_version
 
@@ -1121,7 +1134,7 @@ class UpdateChecker:
                     '/releases', '/release', '/#/releases', '/#/downloads'
                 ]
 
-                print(f"      DEBUG: Trying common download paths...")
+                debug_print(f"      DEBUG: Trying common download paths...")
                 for path in download_paths:
                     try:
                         test_url = urljoin(base, path)
@@ -1132,7 +1145,7 @@ class UpdateChecker:
                         if test_response.status_code == 200:
                             test_soup = BeautifulSoup(test_response.text, 'html.parser')
                             test_version = self._find_version(test_soup)
-                            print(f"      DEBUG: {path} -> {test_version}")
+                            debug_print(f"      DEBUG: {path} -> {test_version}")
                             if test_version:
                                 update_info['version'] = test_version
                                 # Update download URL if we found version on a download page
@@ -1298,7 +1311,7 @@ class UpdateChecker:
             # Debug: show what versions were found (always show if more than 1 version)
             if len(found_versions) > 1:
                 unique_versions = list(dict.fromkeys([v for _, v in found_versions]))[:10]
-                print(f"      DEBUG versions found: {unique_versions}")
+                debug_print(f"      DEBUG versions found: {unique_versions}")
 
             return found_versions[0][1]
 
@@ -1409,17 +1422,418 @@ class UpdateChecker:
 
 
 # ============================================================================
+# MOD UPDATER
+# ============================================================================
+
+class ModUpdater:
+    """Handles downloading and installing mod updates."""
+
+    MOD_EXTENSIONS = {'.package', '.ts4script'}
+    BACKUP_FOLDER = "_ModBackups"
+
+    # Sites that require login - will open browser instead of direct download
+    LOGIN_REQUIRED_DOMAINS = [
+        'patreon.com',
+        'www.patreon.com',
+    ]
+
+    def __init__(self, mods_path: Path):
+        self.mods_path = mods_path
+        self.staging_path = mods_path / "_UpdateStaging"
+        self.backup_path = mods_path / self.BACKUP_FOLDER
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        })
+
+    def requires_login(self, url: str) -> bool:
+        """Check if URL requires login to download."""
+        from urllib.parse import urlparse
+        domain = urlparse(url).netloc.lower()
+        return any(login_domain in domain for login_domain in self.LOGIN_REQUIRED_DOMAINS)
+
+    def open_in_browser(self, url: str) -> None:
+        """Open URL in default browser."""
+        print(f"   Opening in browser: {url}")
+        webbrowser.open(url)
+
+    def download_file(self, url: str, filename: Optional[str] = None) -> Optional[Path]:
+        """Download a file from URL to staging folder.
+
+        Returns path to downloaded file, or None if failed.
+        """
+        try:
+            # Create staging folder
+            self.staging_path.mkdir(exist_ok=True)
+
+            # Start download
+            print(f"   Downloading from {url}...")
+            response = self.session.get(url, stream=True, timeout=60, allow_redirects=True)
+            response.raise_for_status()
+
+            # Determine filename
+            if not filename:
+                # Try to get from Content-Disposition header
+                cd = response.headers.get('Content-Disposition', '')
+                if 'filename=' in cd:
+                    import re
+                    match = re.search(r'filename[*]?=["\']?([^"\';\n]+)', cd)
+                    if match:
+                        filename = match.group(1).strip()
+
+                # Fall back to URL path
+                if not filename:
+                    from urllib.parse import urlparse, unquote
+                    path = urlparse(url).path
+                    filename = unquote(path.split('/')[-1]) or 'download'
+
+            # Clean filename
+            filename = "".join(c for c in filename if c.isalnum() or c in '._- ')
+            download_path = self.staging_path / filename
+
+            # Download with progress
+            total_size = int(response.headers.get('content-length', 0))
+            downloaded = 0
+
+            with open(download_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if total_size > 0:
+                        pct = (downloaded / total_size) * 100
+                        print(f"\r   Downloading: {pct:.0f}%", end='', flush=True)
+
+            print(f"\r   Downloaded: {filename} ({downloaded / 1024:.1f} KB)")
+            return download_path
+
+        except Exception as e:
+            print(f"   Download failed: {e}")
+            return None
+
+    def extract_archive(self, archive_path: Path) -> list[Path]:
+        """Extract archive and return list of mod files found.
+
+        Returns list of paths to .package and .ts4script files.
+        """
+        extract_dir = self.staging_path / f"_{archive_path.stem}_extracted"
+        mod_files = []
+
+        try:
+            # Handle ZIP files
+            if archive_path.suffix.lower() == '.zip':
+                import zipfile
+                print(f"   Extracting {archive_path.name}...")
+                with zipfile.ZipFile(archive_path, 'r') as zf:
+                    zf.extractall(extract_dir)
+
+            # Handle RAR files (requires rarfile or unrar)
+            elif archive_path.suffix.lower() == '.rar':
+                try:
+                    import rarfile
+                    print(f"   Extracting {archive_path.name}...")
+                    with rarfile.RarFile(archive_path, 'r') as rf:
+                        rf.extractall(extract_dir)
+                except ImportError:
+                    print("   RAR extraction requires 'rarfile' package: pip install rarfile")
+                    return []
+
+            # Handle 7z files (requires py7zr)
+            elif archive_path.suffix.lower() == '.7z':
+                try:
+                    import py7zr
+                    print(f"   Extracting {archive_path.name}...")
+                    with py7zr.SevenZipFile(archive_path, 'r') as sz:
+                        sz.extractall(extract_dir)
+                except ImportError:
+                    print("   7z extraction requires 'py7zr' package: pip install py7zr")
+                    return []
+
+            # Not an archive - check if it's a mod file directly
+            elif archive_path.suffix.lower() in self.MOD_EXTENSIONS:
+                return [archive_path]
+
+            else:
+                print(f"   Unknown file type: {archive_path.suffix}")
+                return []
+
+            # Find all mod files in extracted content
+            for file_path in extract_dir.rglob('*'):
+                if file_path.suffix.lower() in self.MOD_EXTENSIONS:
+                    mod_files.append(file_path)
+
+            if mod_files:
+                print(f"   Found {len(mod_files)} mod file(s):")
+                for mf in mod_files:
+                    print(f"      - {mf.name}")
+            else:
+                print("   No mod files found in archive")
+
+            return mod_files
+
+        except Exception as e:
+            print(f"   Extraction failed: {e}")
+            return []
+
+    def find_matching_mod(self, new_file: Path, existing_mods: dict) -> Optional[tuple[str, dict]]:
+        """Find existing mod that matches the new file.
+
+        Uses name similarity to match. Returns (hash, mod_info) or None.
+        """
+        new_name = new_file.stem.lower()
+
+        # Try exact match first
+        for file_hash, mod in existing_mods.items():
+            if mod['name'].lower() == new_name:
+                return (file_hash, mod)
+
+        # Try prefix match (handles version differences like ModName_v1 -> ModName_v2)
+        # Strip common version patterns from both names
+        def strip_version(name: str) -> str:
+            import re
+            # Remove version patterns like _v1, _1.2.3, _2025_7_0, etc.
+            name = re.sub(r'[_\-\s][Vv]?\d+(\.\d+)*[a-zA-Z]?$', '', name)
+            name = re.sub(r'[_\-\s]20\d{2}[_\.]\d+[_\.]\d+$', '', name)
+            return name.lower()
+
+        new_base = strip_version(new_name)
+
+        best_match = None
+        best_score = 0
+
+        for file_hash, mod in existing_mods.items():
+            existing_base = strip_version(mod['name'])
+
+            # Check if base names match
+            if new_base == existing_base:
+                return (file_hash, mod)
+
+            # Check if one contains the other (for partial matches)
+            if new_base in existing_base or existing_base in new_base:
+                # Score by length of overlap
+                score = min(len(new_base), len(existing_base))
+                if score > best_score and score >= 5:  # Minimum 5 chars to match
+                    best_score = score
+                    best_match = (file_hash, mod)
+
+        return best_match
+
+    def backup_mod(self, mod_info: dict) -> Optional[Path]:
+        """Create backup of existing mod before updating.
+
+        Returns path to backup, or None if failed.
+        """
+        try:
+            self.backup_path.mkdir(exist_ok=True)
+
+            source = Path(mod_info['full_path'])
+            if not source.exists():
+                return None
+
+            # Create timestamped backup
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            backup_name = f"{source.stem}_{timestamp}{source.suffix}"
+            backup_file = self.backup_path / backup_name
+
+            shutil.copy2(source, backup_file)
+            debug_print(f"   Backed up to: {backup_name}")
+            return backup_file
+
+        except Exception as e:
+            print(f"   Backup failed: {e}")
+            return None
+
+    def install_mod_file(self, new_file: Path, target_mod: Optional[dict] = None) -> bool:
+        """Install a mod file to the Mods folder.
+
+        If target_mod is provided, replaces that mod. Otherwise installs to root.
+        Returns True on success.
+        """
+        try:
+            if target_mod:
+                # Replace existing mod
+                target_path = Path(target_mod['full_path'])
+
+                # Backup first
+                self.backup_mod(target_mod)
+
+                # Remove old file
+                if target_path.exists():
+                    target_path.unlink()
+
+                # Install new file to same location
+                dest_path = target_path.parent / new_file.name
+            else:
+                # Install to Mods root
+                dest_path = self.mods_path / new_file.name
+
+            shutil.copy2(new_file, dest_path)
+            print(f"   Installed: {new_file.name}")
+            return True
+
+        except Exception as e:
+            print(f"   Installation failed: {e}")
+            return False
+
+    def cleanup_staging(self):
+        """Remove staging folder and its contents."""
+        try:
+            if self.staging_path.exists():
+                shutil.rmtree(self.staging_path)
+        except Exception as e:
+            debug_print(f"   Cleanup warning: {e}")
+
+    def update_mod(self, mod_info: dict, download_url: str, existing_mods: dict) -> bool:
+        """Full update flow for a single mod.
+
+        1. Check if login required -> open browser
+        2. Download file
+        3. Extract if archive
+        4. Find matching mod files
+        5. Backup and install
+
+        Returns True if update was successful.
+        """
+        print(f"\n{'─'*50}")
+        print(f"Updating: {mod_info['name']}")
+        print(f"{'─'*50}")
+
+        # Check if login required
+        if self.requires_login(download_url):
+            print(f"   This mod requires login to download.")
+            print(f"   Opening download page in browser...")
+            self.open_in_browser(download_url)
+            print(f"\n   After downloading, run 'Import downloaded mod' from the menu")
+            print(f"   to install the update.")
+            return False
+
+        # Download
+        downloaded = self.download_file(download_url)
+        if not downloaded:
+            return False
+
+        # Extract if archive
+        mod_files = self.extract_archive(downloaded)
+        if not mod_files:
+            return False
+
+        # Install each mod file
+        success = True
+        for new_file in mod_files:
+            # Try to match to existing mod
+            match = self.find_matching_mod(new_file, existing_mods)
+
+            if match:
+                file_hash, matched_mod = match
+                print(f"   Matched: {new_file.name} -> {matched_mod['name']}")
+                if not self.install_mod_file(new_file, matched_mod):
+                    success = False
+            else:
+                print(f"   New mod (no match found): {new_file.name}")
+                confirm = input("   Install as new mod? (y/n): ").strip().lower()
+                if confirm == 'y':
+                    if not self.install_mod_file(new_file):
+                        success = False
+                else:
+                    print("   Skipped")
+
+        # Cleanup
+        self.cleanup_staging()
+
+        if success:
+            print(f"   ✅ Update complete!")
+        return success
+
+    def import_from_downloads(self, downloads_path: Optional[Path] = None) -> bool:
+        """Import mod from Downloads folder (for mods downloaded via browser).
+
+        Looks for recent mod-related files and offers to import them.
+        """
+        if downloads_path is None:
+            downloads_path = Path.home() / "Downloads"
+
+        if not downloads_path.exists():
+            print(f"Downloads folder not found: {downloads_path}")
+            return False
+
+        # Find recent mod-related files (last 24 hours)
+        recent_files = []
+        cutoff = datetime.now().timestamp() - (24 * 60 * 60)
+
+        for file_path in downloads_path.iterdir():
+            if file_path.is_file() and file_path.stat().st_mtime > cutoff:
+                suffix = file_path.suffix.lower()
+                if suffix in self.MOD_EXTENSIONS or suffix in ['.zip', '.rar', '.7z']:
+                    recent_files.append(file_path)
+
+        if not recent_files:
+            print("No recent mod files found in Downloads folder.")
+            return False
+
+        # Sort by modification time (newest first)
+        recent_files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+
+        print("\nRecent mod files in Downloads:")
+        for i, file_path in enumerate(recent_files[:10], 1):
+            mtime = datetime.fromtimestamp(file_path.stat().st_mtime)
+            print(f"  {i}. {file_path.name} ({mtime.strftime('%H:%M')})")
+
+        choice = input("\nEnter number to import (or 0 to cancel): ").strip()
+        try:
+            idx = int(choice) - 1
+            if idx < 0 or idx >= len(recent_files):
+                print("Cancelled")
+                return False
+        except ValueError:
+            print("Cancelled")
+            return False
+
+        selected = recent_files[idx]
+        print(f"\nImporting: {selected.name}")
+
+        # Copy to staging
+        self.staging_path.mkdir(exist_ok=True)
+        staging_file = self.staging_path / selected.name
+        shutil.copy2(selected, staging_file)
+
+        # Extract and find mods
+        mod_files = self.extract_archive(staging_file)
+        if not mod_files:
+            self.cleanup_staging()
+            return False
+
+        # Install each
+        success = True
+        for new_file in mod_files:
+            if not self.install_mod_file(new_file):
+                success = False
+
+        self.cleanup_staging()
+
+        if success:
+            print(f"\n✅ Import complete!")
+
+            # Offer to delete original
+            delete = input("Delete original from Downloads? (y/n): ").strip().lower()
+            if delete == 'y':
+                selected.unlink()
+                print("   Deleted from Downloads")
+
+        return success
+
+
+# ============================================================================
 # MOD MANAGER
 # ============================================================================
 
 class SimsModManager:
     """Main mod manager class that ties everything together."""
-    
+
     def __init__(self, mods_path: Optional[Path] = None):
         self.mods_path = mods_path or get_default_mods_path()
         self.db = ModDatabase(self.mods_path)
         self.scanner = ModScanner(self.mods_path)
         self.update_checker = UpdateChecker()
+        self.mod_updater = ModUpdater(self.mods_path)
         
         print(f"Sims 4 Mod Manager initialized")
         print(f"Mods folder: {self.mods_path}")
@@ -1733,6 +2147,8 @@ class SimsModManager:
                     if comparison == 'update':
                         print(f"   ⚠️  UPDATE AVAILABLE!")
                         needs_update.append({
+                            'hash': file_hash,
+                            'mod': mod,
                             'name': mod['name'],
                             'url': source_url,
                             'local_version': local_version,
@@ -1747,12 +2163,16 @@ class SimsModManager:
                         up_to_date.append(mod['name'])
                     else:
                         unknown_status.append({
+                            'hash': file_hash,
+                            'mod': mod,
                             'name': mod['name'],
                             'url': source_url,
                             'remote_info': update_info
                         })
                 else:
                     unknown_status.append({
+                        'hash': file_hash,
+                        'mod': mod,
                         'name': mod['name'],
                         'url': source_url,
                         'remote_info': update_info
@@ -1767,6 +2187,8 @@ class SimsModManager:
             else:
                 print(f"   Could not retrieve update info")
                 unknown_status.append({
+                    'hash': file_hash,
+                    'mod': mod,
                     'name': mod['name'],
                     'url': source_url,
                     'remote_info': None
@@ -1779,12 +2201,9 @@ class SimsModManager:
 
         if needs_update:
             print(f"\n🔴 UPDATES AVAILABLE ({len(needs_update)}):")
-            for item in needs_update:
-                print(f"   📦 {item['name']}")
+            for i, item in enumerate(needs_update, 1):
+                print(f"   {i}. 📦 {item['name']}")
                 print(f"      {item.get('local_version', '?')} → {item.get('remote_version', '?')}")
-                print(f"      URL: {item['url']}")
-                if item['remote_info'] and item['remote_info'].get('download_url'):
-                    print(f"      Download: {item['remote_info']['download_url']}")
 
         if up_to_date:
             print(f"\n🟢 UP TO DATE ({len(up_to_date)}):")
@@ -1796,6 +2215,50 @@ class SimsModManager:
             print("   (Could not compare versions)")
             for item in unknown_status:
                 print(f"   ? {item['name']}")
+
+        # Offer to install updates
+        if needs_update:
+            print(f"\n{'─'*60}")
+            print("INSTALL UPDATES")
+            print(f"{'─'*60}")
+            print("\nOptions:")
+            print("  Enter a number (1-{}) to update that mod".format(len(needs_update)))
+            print("  Enter 'all' to update all mods")
+            print("  Enter 'skip' to skip updates")
+
+            choice = input("\nYour choice: ").strip().lower()
+
+            if choice == 'skip' or choice == '':
+                print("Updates skipped.")
+            elif choice == 'all':
+                print("\nUpdating all mods...")
+                for item in needs_update:
+                    download_url = item['remote_info'].get('download_url') or item['url']
+                    self.mod_updater.update_mod(item['mod'], download_url, self.db.data["mods"])
+                # Re-scan after updates
+                print("\nRe-scanning mods folder...")
+                self.scan_mods()
+            else:
+                try:
+                    idx = int(choice) - 1
+                    if 0 <= idx < len(needs_update):
+                        item = needs_update[idx]
+                        download_url = item['remote_info'].get('download_url') or item['url']
+                        self.mod_updater.update_mod(item['mod'], download_url, self.db.data["mods"])
+                        # Re-scan after update
+                        print("\nRe-scanning mods folder...")
+                        self.scan_mods()
+                    else:
+                        print("Invalid selection.")
+                except ValueError:
+                    print("Invalid input.")
+
+    def import_downloaded_mod(self):
+        """Import a mod from the Downloads folder."""
+        self.mod_updater.import_from_downloads()
+        # Re-scan after import
+        print("\nRe-scanning mods folder...")
+        self.scan_mods()
     
     def find_potentially_broken(self) -> list[dict]:
         """Find mods that might be broken after a game update."""
@@ -1892,6 +2355,15 @@ def main():
     ╚═══════════════════════════════════════════════════════════╝
     """)
 
+    # Parse command line arguments
+    global DEBUG
+    args = sys.argv[1:]
+
+    if '--debug' in args:
+        DEBUG = True
+        args.remove('--debug')
+        print("[Debug mode enabled]")
+
     # Check for updates on startup
     updater = AutoUpdater()
     if updater.prompt_and_update():
@@ -1902,8 +2374,8 @@ def main():
 
     # Check for custom path argument
     mods_path = None
-    if len(sys.argv) > 1:
-        mods_path = Path(sys.argv[1])
+    if args:
+        mods_path = Path(args[0])
 
     manager = SimsModManager(mods_path)
     
@@ -1925,33 +2397,37 @@ def main():
         print("1. Scan mods folder")
         print("2. List all mods")
         print("3. List mods (detailed)")
-        print("4. Check for updates")
-        print("5. Find potentially broken mods")
-        print("6. Add source URL to mod")
-        print("7. Backup mods folder")
-        print("8. Generate report")
-        print("9. Debug mod version detection")
+        print("4. Check for updates & install")
+        print("5. Import mod from Downloads")
+        print("6. Find potentially broken mods")
+        print("7. Add source URL to mod")
+        print("8. Backup mods folder")
+        print("9. Generate report")
+        print("10. Debug mod version detection")
         print("0. Exit")
         print()
 
-        choice = input("Enter choice (1-9, 0 to exit): ").strip()
+        choice = input("Enter choice (0-10): ").strip()
         
         if choice == '1':
             manager.scan_mods()
-        
+
         elif choice == '2':
             manager.list_mods(show_details=False)
-        
+
         elif choice == '3':
             manager.list_mods(show_details=True)
-        
+
         elif choice == '4':
             manager.check_for_updates()
-        
+
         elif choice == '5':
-            manager.find_potentially_broken()
-        
+            manager.import_downloaded_mod()
+
         elif choice == '6':
+            manager.find_potentially_broken()
+
+        elif choice == '7':
             print("\nAdd source URL to a mod")
             print("(This helps track updates from ModTheSims and other sites)")
             print("Tip: Use wildcards to match multiple mods (e.g., 'WonderfulWhims*', '*MCCC*')")
@@ -1960,16 +2436,16 @@ def main():
             creator = input("Enter creator name (optional): ").strip() or None
             notes = input("Enter notes (optional): ").strip() or None
             manager.add_mod_source(mod_name, source_url, creator, notes)
-        
-        elif choice == '7':
+
+        elif choice == '8':
             confirm = input("Create backup? This may take a while for large mod folders (y/n): ")
             if confirm.lower() == 'y':
                 manager.backup_mods()
-        
-        elif choice == '8':
-            print(manager.generate_report())
 
         elif choice == '9':
+            print(manager.generate_report())
+
+        elif choice == '10':
             print("\nDebug mod version detection")
             mod_name = input("Enter mod name (partial match OK): ").strip()
             manager.debug_mod_version(mod_name)
@@ -1979,7 +2455,7 @@ def main():
             break
 
         else:
-            print("Invalid choice. Please enter 0-9.")
+            print("Invalid choice. Please enter 0-10.")
 
 
 if __name__ == "__main__":
