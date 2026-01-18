@@ -25,14 +25,14 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0  # Full history for changelog generation
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3'
           cache: 'pip'
 
       - name: Install dependencies
@@ -71,7 +71,7 @@ jobs:
           print(f"Updated version to {version}")
 
       - name: Build executable
-        run: pyinstaller sims4_mod_manager.spec --noconfirm
+        run: python -m PyInstaller sims4_mod_manager.spec --noconfirm
 
       - name: Verify build
         id: verify

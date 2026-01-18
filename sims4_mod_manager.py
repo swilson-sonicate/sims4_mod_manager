@@ -54,7 +54,7 @@ class AutoUpdater:
     """Handles automatic updates from GitHub Releases."""
 
     # TODO: Set this to your GitHub repository (e.g., "username/sims4_mod_manager")
-    GITHUB_REPO = "shawnplusplus/sims4_mod_manager"
+    GITHUB_REPO = "swilson-sonicate/sims4_mod_manager"
     GITHUB_API_URL = "https://api.github.com/repos/{repo}/releases/latest"
     UPDATE_CHECK_TIMEOUT = 5  # seconds
 

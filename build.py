@@ -72,7 +72,7 @@ def cmd_build():
     print("Building executable...")
     run([sys.executable, '-m', 'pip', 'install', '-r', 'requirements.txt', '-q'])
     run([sys.executable, '-m', 'pip', 'install', '-r', 'requirements-dev.txt', '-q'])
-    run(['pyinstaller', 'sims4_mod_manager.spec', '--noconfirm'])
+    run([sys.executable, '-m', 'PyInstaller', 'sims4_mod_manager.spec', '--noconfirm'])
 
     exe_path = Path('dist/Sims4ModManager.exe')
     if exe_path.exists():

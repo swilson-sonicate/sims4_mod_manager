@@ -23,7 +23,47 @@ with open(spec_dir / 'sims4_mod_manager.py', 'r', encoding='utf-8') as f:
             break
 
 version = version_info.get('__version__', '1.0.0')
-version_tuple = tuple(int(x) for x in version.split('.')) + (0,) * (4 - len(version.split('.')))
+version_parts = [int(x) for x in version.split('.')]
+while len(version_parts) < 4:
+    version_parts.append(0)
+version_tuple = tuple(version_parts[:4])
+
+# Generate Windows version info file BEFORE it's needed
+version_info_path = None
+if sys.platform == 'win32':
+    version_info_path = spec_dir / 'version_info.txt'
+    version_info_content = f'''# UTF-8
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers={version_tuple},
+    prodvers={version_tuple},
+    mask=0x3f,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo(
+      [
+      StringTable(
+        u'040904B0',
+        [StringStruct(u'CompanyName', u''),
+        StringStruct(u'FileDescription', u'Sims 4 Mod Manager'),
+        StringStruct(u'FileVersion', u'{version}'),
+        StringStruct(u'InternalName', u'Sims4ModManager'),
+        StringStruct(u'LegalCopyright', u''),
+        StringStruct(u'OriginalFilename', u'Sims4ModManager.exe'),
+        StringStruct(u'ProductName', u'Sims 4 Mod Manager'),
+        StringStruct(u'ProductVersion', u'{version}')])
+      ]),
+    VarFileInfo([VarStruct(u'Translation', [1033, 1200])])
+  ]
+)
+'''
+    with open(version_info_path, 'w', encoding='utf-8') as f:
+        f.write(version_info_content)
 
 a = Analysis(
     ['sims4_mod_manager.py'],
@@ -67,45 +107,6 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    version='version_info.txt' if sys.platform == 'win32' else None,
+    version=str(version_info_path) if version_info_path else None,
     icon=None,  # Add icon path here if you have one, e.g., 'icon.ico'
 )
-
-# Generate Windows version info file
-if sys.platform == 'win32':
-    version_info_content = f'''# UTF-8
-#
-# For more details about fixed file info 'ffi' see:
-# https://docs.microsoft.com/en-us/windows/win32/menurc/versioninfo-resource
-
-VSVersionInfo(
-  ffi=FixedFileInfo(
-    filevers={version_tuple},
-    prodvers={version_tuple},
-    mask=0x3f,
-    flags=0x0,
-    OS=0x40004,
-    fileType=0x1,
-    subtype=0x0,
-    date=(0, 0)
-  ),
-  kids=[
-    StringFileInfo(
-      [
-      StringTable(
-        u'040904B0',
-        [StringStruct(u'CompanyName', u''),
-        StringStruct(u'FileDescription', u'Sims 4 Mod Manager'),
-        StringStruct(u'FileVersion', u'{version}'),
-        StringStruct(u'InternalName', u'Sims4ModManager'),
-        StringStruct(u'LegalCopyright', u''),
-        StringStruct(u'OriginalFilename', u'Sims4ModManager.exe'),
-        StringStruct(u'ProductName', u'Sims 4 Mod Manager'),
-        StringStruct(u'ProductVersion', u'{version}')])
-      ]),
-    VarFileInfo([VarStruct(u'Translation', [1033, 1200])])
-  ]
-)
-'''
-    with open(spec_dir / 'version_info.txt', 'w', encoding='utf-8') as f:
-        f.write(version_info_content)
